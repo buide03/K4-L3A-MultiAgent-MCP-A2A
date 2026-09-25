@@ -14,6 +14,15 @@ from .contracts import Contracts
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
+REQUIRED_LIFECYCLE = (
+    "case_received",
+    "task_assigned",
+    "tool_result_consumed",
+    "handoff",
+    "policy_decided",
+    "verification_completed",
+    "case_finalized",
+)
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -24,6 +33,34 @@ def _json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected a JSON object")
     return value
+
+
+def validate_case_lifecycle(
+    case_id: str,
+    output: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> None:
+    event_types = [event["event_type"] for event in events]
+    position = -1
+    for required in REQUIRED_LIFECYCLE:
+        try:
+            position = event_types.index(required, position + 1)
+        except ValueError as exc:
+            raise ValueError(
+                f"trace for {case_id} is missing ordered lifecycle event {required!r}"
+            ) from exc
+    consumed_refs = {
+        ref
+        for event in events
+        if event["event_type"] == "tool_result_consumed"
+        for ref in event.get("evidence_refs", [])
+    }
+    unlinked = sorted(set(output["evidence_refs"]) - consumed_refs)
+    if unlinked:
+        raise ValueError(
+            f"outputs/{case_id}.json contains evidence absent from tool_result_consumed: "
+            f"{unlinked}"
+        )
 
 
 def build_manifest(case_set: CaseSet) -> dict[str, Any]:
@@ -65,6 +102,9 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    events_by_case: dict[str, list[dict[str, Any]]] = {
+        case_id: [] for case_id in case_set.case_ids
+    }
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -78,7 +118,11 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    for case_id, output in outputs.items():
+        validate_case_lifecycle(case_id, output, events_by_case[case_id])
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
